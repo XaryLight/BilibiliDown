@@ -1,0 +1,12 @@
+# 构建产物
+build/
+cmake-build-*/
+.idea/
+*.user
+
+# 部署输出
+BilibiliDown.exe
+*.dll
+
+# 日志
+*.log
