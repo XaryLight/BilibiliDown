@@ -38,6 +38,11 @@ public:
 
 signals:
     void progress(int taskId, qint64 received, qint64 total, double speedBytesPerSec);
+    // 单个分P的进度 (clipIndex 从 0 开始; 供展开视图显示每个分P独立进度)
+    void clipProgress(int taskId, int clipIndex, qint64 received, qint64 total, double speedBytesPerSec);
+    // 单个分P完成/失败 (doneCount 为已完成分P数; sha256 为该分P文件摘要)
+    void clipDone(int taskId, int clipIndex, const QString &file, int doneCount, int totalCount,
+                  const QString &sha256);
     void statusChanged(int taskId, model::TaskStatus status, const QString &text);
     void clipStarted(int taskId, int clipIndex, const QString &clipTitle);
     void clipFinished(int taskId, int clipIndex, const QString &file);

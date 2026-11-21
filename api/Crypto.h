@@ -19,6 +19,8 @@ public:
     static QByteArray md5(const QByteArray &data);
     static QString md5Hex(const QByteArray &data);
     static QString sha1Hex(const QByteArray &data);
+    // 计算文件 SHA256 (流式读取, 返回十六进制小写; 读失败返回空串)
+    static QString fileSha256(const QString &filePath);
 
     // AV <-> BV
     static int64_t bv2av(const QString &bvId);

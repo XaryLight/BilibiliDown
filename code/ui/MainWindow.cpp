@@ -3,6 +3,7 @@
 #include "TabDownload.h"
 #include "TabSettings.h"
 #include "LoginDialog.h"
+#include "ModernStyle.h"
 
 #include <api/Logger.h>
 #include <api/Config.h>
@@ -23,6 +24,8 @@
 #include <QLabel>
 #include <QSystemTrayIcon>
 #include <QApplication>
+#include <QPushButton>
+#include <QAbstractButton>
 
 namespace bili::ui {
 
@@ -48,6 +51,12 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     setupStatusBar();
     setupLogDock();
     setupTray();
+
+    // 标签页切换: 内容区淡入, 提升切换质感
+    connect(m_tabs, &QTabWidget::currentChanged, this, [this](int) {
+        if (QWidget *w = m_tabs->currentWidget())
+            ModernStyle::fadeIn(w, 180);
+    });
 
     // ---- 日志信号 ----
     connect(&Logger::instance(), &bili::api::Logger::logAppended,
@@ -77,6 +86,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 
     QString cookie = Config::instance().cookies();
     m_statusCookie->setText(cookie.isEmpty() ? "未登录" : "Cookie 已加载");
+
+    // 启动淡入动画
+    ModernStyle::fadeIn(this, 360);
 }
 
 MainWindow::~MainWindow() = default;
@@ -90,7 +102,7 @@ void MainWindow::setupMenu() {
     connect(actHideTray, &QAction::triggered, this, &MainWindow::hideToTray);
     fileMenu->addSeparator();
     QAction *actQuit = fileMenu->addAction("退出");
-    connect(actQuit, &QAction::triggered, this, &QWidget::close);
+    connect(actQuit, &QAction::triggered, this, &MainWindow::quitApp);
 
     // ---- 账户菜单 ----
     QMenu *accountMenu = menuBar()->addMenu("账户");
@@ -190,6 +202,7 @@ void MainWindow::toggleMainWindow() {
         showNormal();
         activateWindow();
         raise();
+        ModernStyle::fadeIn(this, 260); // 从托盘恢复时淡入
     }
 }
 
@@ -205,7 +218,13 @@ void MainWindow::hideToTray() {
 
 void MainWindow::quitApp() {
     m_forceQuit = true;
-    close();
+    // 托盘"退出": 停止并等待所有下载线程结束, 持久化未完成任务, 再彻底退出进程
+    auto &engine = bili::downloader::DownloadEngine::instance();
+    engine.stopAll();
+    engine.saveTasksToDisk();
+    engine.waitAllStopped();
+    if (m_tray) m_tray->hide();
+    qApp->quit();
 }
 
 void MainWindow::onTrayTaskFinished(int taskId, bool success, const QString &error) {
@@ -297,20 +316,63 @@ void MainWindow::openSaveFolder() {
 }
 
 void MainWindow::closeEvent(QCloseEvent *event) {
-    // 最小化到托盘: 关闭窗口仅隐藏 (下载继续), 从托盘菜单"退出"才真正结束
+    auto &engine = bili::downloader::DownloadEngine::instance();
+
+    // 最小化到托盘: 关闭窗口仅隐藏 (下载默认继续)
     if (!m_forceQuit && m_tray && Config::instance().minimizeToTray()) {
+        // 有正在下载的任务时提示用户选择: 暂停并最小化 / 继续后台下载 / 取消
+        if (engine.hasActiveTasks()) {
+            QMessageBox box(this);
+            box.setWindowTitle("关闭提示");
+            box.setText("当前有任务正在下载。关闭窗口后如何处理?");
+            box.setInformativeText("选择“暂停全部”将停止下载并保存进度；重启程序后可在下载列表继续。");
+            QPushButton *btnPause = box.addButton("暂停全部并最小化", QMessageBox::AcceptRole);
+            QPushButton *btnContinue = box.addButton("继续后台下载", QMessageBox::ApplyRole);
+            QPushButton *btnCancel = box.addButton("取消", QMessageBox::RejectRole);
+            box.setDefaultButton(btnContinue);
+            box.exec();
+            QAbstractButton *clicked = box.clickedButton();
+            if (clicked == btnCancel) {
+                event->ignore();
+                return;
+            }
+            if (clicked == btnPause) {
+                engine.stopAll();
+                engine.saveTasksToDisk();
+                m_tray->showMessage("BilibiliDown", "下载已暂停并保存进度, 重启后可继续",
+                                    QSystemTrayIcon::Information, 4000);
+            } else {
+                m_tray->showMessage("BilibiliDown", "程序已最小化到托盘, 下载在后台继续",
+                                    QSystemTrayIcon::Information, 3000);
+            }
+        } else {
+            m_tray->showMessage("BilibiliDown", "程序已最小化到任务栏托盘, 双击图标可恢复主窗口",
+                                QSystemTrayIcon::Information, 3000);
+        }
         hide();
-        m_tray->showMessage("BilibiliDown", "程序已最小化到任务栏托盘, 双击图标可恢复主窗口",
-                            QSystemTrayIcon::Information, 3000);
         event->ignore();
         return;
     }
-    // 停止所有下载
-    bili::downloader::DownloadEngine::instance().stopAll();
+
+    // 真正退出: 有活动任务时同样给出暂停提示 (无托盘/禁用托盘的场景)
+    if (engine.hasActiveTasks()) {
+        auto ret = QMessageBox::question(
+            this, "关闭提示",
+            "当前有任务正在下载。退出程序将暂停下载并保存进度, 重启后可在下载列表继续。是否退出?",
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (ret != QMessageBox::Yes) {
+            event->ignore();
+            return;
+        }
+    }
+    // 停止+等待所有下载线程, 保存配置与任务, 避免进程残留
+    engine.stopAll();
+    engine.saveTasksToDisk();
+    engine.waitAllStopped();
     Config::instance().save();
     if (m_tray)
         m_tray->hide();
-    QMainWindow::closeEvent(event);
+    event->accept();
 }
 
 } // namespace bili::ui

@@ -11,6 +11,7 @@
 #include <QRegularExpression>
 #include <QRandomGenerator>
 #include <QMutex>
+#include <QFile>
 #include <cstring>
 
 namespace bili::api {
@@ -26,6 +27,19 @@ QString Crypto::md5Hex(const QByteArray &data) {
 
 QString Crypto::sha1Hex(const QByteArray &data) {
     return QString(QCryptographicHash::hash(data, QCryptographicHash::Sha1).toHex());
+}
+
+QString Crypto::fileSha256(const QString &filePath) {
+    QFile f(filePath);
+    if (!f.open(QIODevice::ReadOnly))
+        return QString();
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    if (!hash.addData(&f)) {
+        f.close();
+        return QString();
+    }
+    f.close();
+    return QString::fromLatin1(hash.result().toHex());
 }
 
 // ---------------- AV <-> BV ----------------

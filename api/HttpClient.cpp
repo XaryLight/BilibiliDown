@@ -260,6 +260,21 @@ bool HttpClient::downloadFile(const QString &url, const QString &destPath,
             partFile.close();
             return fail(err);
         }
+        // 断点续传健壮性: 若服务端未接受 Range (返回 200 而非 206), 说明它从头返回了
+        // 完整文件。此时必须丢弃旧 .part 数据从头写, 否则 append 会把完整内容接到旧数据
+        // 后面, 造成文件损坏 / 暂停后越下越大。
+        int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (offset > 0 && statusCode != 206) {
+            Logger::warn(QString("服务端未接受断点续传(HTTP %1, 期望206), 从头下载: %2")
+                             .arg(statusCode).arg(QFileInfo(partPath).fileName()));
+            partFile.close();
+            if (!partFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                reply->abort();
+                reply->deleteLater();
+                return fail(QString("无法重置临时文件: %1").arg(partPath));
+            }
+            offset = 0;
+        }
         bool ok = false;
         qint64 contentLength = reply->rawHeader("Content-Length").toLongLong(&ok);
         if (ok) total = contentLength;

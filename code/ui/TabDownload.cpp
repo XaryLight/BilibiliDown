@@ -13,31 +13,29 @@
 #include <QPushButton>
 #include <QColor>
 #include <QBrush>
+#include <QFont>
 
 namespace bili::ui {
 
 using bili::api::Config;
 namespace model = bili::model;
 
+// 角色: 区分顶层任务项 / 分P子项
+static const int ROLE_TASK_ID = Qt::UserRole + 1;
+static const int ROLE_CLIP_INDEX = Qt::UserRole + 2; // -1 表示顶层任务项
+
 TabDownload::TabDownload(QWidget *parent) : QWidget(parent) {
     setupUi();
 
-    // 引擎信号连接
     auto &engine = bili::downloader::DownloadEngine::instance();
-    connect(&engine, &bili::downloader::DownloadEngine::taskAdded,
-            this, &TabDownload::onTaskAdded);
-    connect(&engine, &bili::downloader::DownloadEngine::taskRemoved,
-            this, &TabDownload::onTaskRemoved);
-    connect(&engine, &bili::downloader::DownloadEngine::taskProgress,
-            this, &TabDownload::onTaskProgress);
-    connect(&engine, &bili::downloader::DownloadEngine::taskStatusChanged,
-            this, &TabDownload::onTaskStatusChanged);
-    connect(&engine, &bili::downloader::DownloadEngine::taskFinished,
-            this, &TabDownload::onTaskFinished);
-    connect(&engine, &bili::downloader::DownloadEngine::logLine,
-            this, [](const QString &line) { Q_UNUSED(line) });
+    connect(&engine, &bili::downloader::DownloadEngine::taskAdded, this, &TabDownload::onTaskAdded);
+    connect(&engine, &bili::downloader::DownloadEngine::taskRemoved, this, &TabDownload::onTaskRemoved);
+    connect(&engine, &bili::downloader::DownloadEngine::taskProgress, this, &TabDownload::onTaskProgress);
+    connect(&engine, &bili::downloader::DownloadEngine::clipProgress, this, &TabDownload::onClipProgress);
+    connect(&engine, &bili::downloader::DownloadEngine::clipDone, this, &TabDownload::onClipDone);
+    connect(&engine, &bili::downloader::DownloadEngine::taskStatusChanged, this, &TabDownload::onTaskStatusChanged);
+    connect(&engine, &bili::downloader::DownloadEngine::taskFinished, this, &TabDownload::onTaskFinished);
 
-    // 速度定时刷新
     m_refreshTimer = new QTimer(this);
     connect(m_refreshTimer, &QTimer::timeout, this, &TabDownload::refreshSpeeds);
     m_refreshTimer->start(1000);
@@ -46,7 +44,7 @@ TabDownload::TabDownload(QWidget *parent) : QWidget(parent) {
 void TabDownload::setupUi() {
     QVBoxLayout *layout = new QVBoxLayout(this);
 
-    // ---- 工具按钮 ----
+    // 工具按钮
     QHBoxLayout *btnLayout = new QHBoxLayout();
     m_startBtn = new QPushButton("开始", this);
     m_stopBtn = new QPushButton("停止", this);
@@ -70,39 +68,36 @@ void TabDownload::setupUi() {
     connect(m_stopAllBtn, &QPushButton::clicked, this, &TabDownload::onStopAllClicked);
     connect(openFolderBtn, &QPushButton::clicked, this, &TabDownload::onOpenFolderClicked);
 
-    // ---- 任务表格 ----
-    m_model = new QStandardItemModel(this);
-    m_model->setColumnCount(8);
-    m_model->setHeaderData(0, Qt::Horizontal, "ID");
-    m_model->setHeaderData(1, Qt::Horizontal, "标题");
-    m_model->setHeaderData(2, Qt::Horizontal, "清晰度");
-    m_model->setHeaderData(3, Qt::Horizontal, "状态");
-    m_model->setHeaderData(4, Qt::Horizontal, "进度");
-    m_model->setHeaderData(5, Qt::Horizontal, "分P");
-    m_model->setHeaderData(6, Qt::Horizontal, "大小");
-    m_model->setHeaderData(7, Qt::Horizontal, "速度");
-
-    m_table = new QTableView(this);
-    m_table->setModel(m_model);
-    m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
-    m_table->setSelectionMode(QAbstractItemView::SingleSelection);
-    m_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    m_table->setAlternatingRowColors(true);
-    m_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-    m_table->horizontalHeader()->resizeSection(0, 40);
-    m_table->horizontalHeader()->resizeSection(4, 150);
-    layout->addWidget(m_table, 1);
+    // 树形任务池
+    m_tree = new QTreeWidget(this);
+    m_tree->setColumnCount(8);
+    QStringList headers;
+    headers << "ID/分P" << "标题" << "清晰度" << "状态" << "进度" << "分P" << "大小" << "速度";
+    m_tree->setHeaderLabels(headers);
+    m_tree->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_tree->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    m_tree->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_tree->setAlternatingRowColors(true);
+    m_tree->setIndentation(20);
+    m_tree->setRootIsDecorated(true);
+    m_tree->header()->setSectionResizeMode(1, QHeaderView::Stretch);
+    m_tree->header()->resizeSection(0, 64);
+    m_tree->header()->resizeSection(4, 160);
+    m_tree->header()->resizeSection(5, 64);
+    layout->addWidget(m_tree, 1);
 }
 
-int TabDownload::rowOfTask(int taskId) const {
-    for (int row = 0; row < m_model->rowCount(); row++) {
-        if (m_model->item(row, 0) && m_model->item(row, 0)->text().toInt() == taskId)
-            return row;
+QTreeWidgetItem *TabDownload::topItemOf(int taskId) const {
+    for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
+        QTreeWidgetItem *it = m_tree->topLevelItem(i);
+        if (it && it->data(0, ROLE_TASK_ID).toInt() == taskId &&
+            it->data(0, ROLE_CLIP_INDEX).toInt() == -1)
+            return it;
     }
-    return -1;
+    return nullptr;
 }
 
-QString TabDownload::formatSize(qint64 bytes) const {
+QString TabDownload::formatSize(qint64 bytes) {
     if (bytes <= 0) return "-";
     if (bytes >= 1024LL * 1024 * 1024)
         return QString::number(bytes / 1024.0 / 1024.0 / 1024.0, 'f', 2) + " GB";
@@ -113,7 +108,7 @@ QString TabDownload::formatSize(qint64 bytes) const {
     return QString::number(bytes) + " B";
 }
 
-QString TabDownload::formatSpeed(double bytesPerSec) const {
+QString TabDownload::formatSpeed(double bytesPerSec) {
     if (bytesPerSec <= 0) return "-";
     if (bytesPerSec >= 1024 * 1024)
         return QString::number(bytesPerSec / 1024.0 / 1024.0, 'f', 2) + " MB/s";
@@ -124,49 +119,105 @@ QString TabDownload::formatSpeed(double bytesPerSec) const {
 
 void TabDownload::onTaskAdded(int taskId) {
     auto task = bili::downloader::DownloadEngine::instance().taskSnapshot(taskId);
-    QList<QStandardItem *> row;
-    row << new QStandardItem(QString::number(taskId));
-    row << new QStandardItem(task.displayName());
-    row << new QStandardItem(model::videoQualityText(task.qn));
-    row << new QStandardItem(model::taskStatusText(task.status));
-    row << new QStandardItem("0%");
-    row << new QStandardItem(QString("0/%1").arg(task.videoInfo.clipCount()));
-    row << new QStandardItem("-");
-    row << new QStandardItem("-");
-    for (auto *item : row)
-        item->setEditable(false);
-    m_model->appendRow(row);
+    auto *top = new QTreeWidgetItem();
+    top->setData(0, ROLE_TASK_ID, taskId);
+    top->setData(0, ROLE_CLIP_INDEX, -1);
+    top->setText(0, QString("#%1").arg(taskId));
+    top->setText(1, task.displayName());
+    top->setText(2, model::videoQualityText(task.qn));
+    top->setText(3, model::taskStatusText(task.status));
+    top->setText(4, "0%");
+    top->setText(5, QString("0/%1").arg(task.videoInfo.clipCount()));
+    top->setText(6, "-");
+    top->setText(7, "-");
+    QFont bold = top->font(1);
+    bold.setBold(true);
+    top->setFont(1, bold);
+
+    // 多分P: 建立子项 (可展开查看每个分P进度)
+    const int clipCount = task.videoInfo.clipCount();
+    for (int i = 0; i < clipCount; ++i) {
+        const auto &clip = task.videoInfo.clips.at(i);
+        auto *child = new QTreeWidgetItem();
+        child->setData(0, ROLE_TASK_ID, taskId);
+        child->setData(0, ROLE_CLIP_INDEX, i);
+        child->setText(0, QString("p%1").arg(clip.page > 0 ? clip.page : i + 1));
+        child->setText(1, clip.title.isEmpty() ? clip.avTitle : clip.title);
+        child->setText(3, "等待");
+        child->setText(4, "0%");
+        top->addChild(child);
+    }
+    // 单项视频不默认展开; 多分P默认展开便于查看
+    top->setExpanded(clipCount > 1);
+    m_tree->addTopLevelItem(top);
 }
 
 void TabDownload::onTaskRemoved(int taskId) {
-    int row = rowOfTask(taskId);
-    if (row >= 0)
-        m_model->removeRow(row);
+    if (auto *top = topItemOf(taskId))
+        delete top;
+}
+
+void TabDownload::updateTopProgress(int taskId) {
+    auto *top = topItemOf(taskId);
+    if (!top) return;
+    auto task = bili::downloader::DownloadEngine::instance().taskSnapshot(taskId);
+    // 顶层进度 = 各分P平均完成度; 分P列显示 已完成/总数
+    double sum = 0.0;
+    int counted = 0;
+    for (const auto &cp : task.clipProgress) {
+        if (cp.total > 0) { sum += double(cp.received) / double(cp.total); ++counted; }
+    }
+    double pct = counted > 0 ? sum / counted * 100.0 : task.progress() * 100.0;
+    top->setText(4, QString("%1%").arg(pct, 0, 'f', 1));
+    top->setText(5, QString("%1/%2").arg(task.doneClips).arg(task.totalClips));
 }
 
 void TabDownload::onTaskProgress(int taskId, qint64 received, qint64 total, double speed) {
-    int row = rowOfTask(taskId);
-    if (row < 0) return;
-    double pct = total > 0 ? static_cast<double>(received) / static_cast<double>(total) * 100.0 : 0.0;
-    // 进度条文本
-    QString progressText = QString("%1%  %2/%3")
-                               .arg(pct, 0, 'f', 1)
-                               .arg(formatSize(received), formatSize(total));
-    m_model->item(row, 4)->setText(progressText);
-    m_model->item(row, 6)->setText(formatSize(total));
-    if (speed > 0)
-        m_model->item(row, 7)->setText(formatSpeed(speed));
+    auto *top = topItemOf(taskId);
+    if (!top) return;
+    top->setText(6, formatSize(total));
+    if (speed > 0) top->setText(7, formatSpeed(speed));
+    updateTopProgress(taskId);
+}
+
+void TabDownload::onClipProgress(int taskId, int clipIndex, qint64 received, qint64 total, double speed) {
+    auto *top = topItemOf(taskId);
+    if (!top) return;
+    auto *child = top->child(clipIndex);
+    if (!child) return;
+    double pct = total > 0 ? double(received) / double(total) * 100.0 : 0.0;
+    child->setText(4, QString("%1%  %2/%3").arg(pct, 0, 'f', 1)
+                          .arg(formatSize(received), formatSize(total)));
+    child->setText(6, formatSize(total));
+    child->setText(7, formatSpeed(speed));
+    if (child->text(3) == "等待") child->setText(3, "下载中");
+    updateTopProgress(taskId);
+}
+
+void TabDownload::onClipDone(int taskId, int clipIndex, const QString &file,
+                             int doneCount, int totalCount, const QString &sha256) {
+    auto *top = topItemOf(taskId);
+    if (!top) return;
+    auto *child = top->child(clipIndex);
+    if (child) {
+        child->setText(3, "完成");
+        child->setText(4, "100%");
+        child->setText(7, "-");
+        child->setText(1, QString("%1  [SHA256 %2]")
+                              .arg(child->text(1), sha256.isEmpty() ? "?" : sha256.left(12)));
+        child->setToolTip(1, file + "\nSHA256: " + sha256);
+        child->setForeground(3, QBrush(QColor(0, 150, 0)));
+    }
+    top->setText(5, QString("%1/%2").arg(doneCount).arg(totalCount));
+    updateTopProgress(taskId);
 }
 
 void TabDownload::onTaskStatusChanged(int taskId, model::TaskStatus status, const QString &text) {
-    int row = rowOfTask(taskId);
-    if (row < 0) return;
+    auto *top = topItemOf(taskId);
+    if (!top) return;
     QString statusStr = model::taskStatusText(status);
-    if (!text.isEmpty())
-        statusStr += " - " + text;
-    m_model->item(row, 3)->setText(statusStr);
-
-    // 颜色提示
+    if (!text.isEmpty()) statusStr += " - " + text;
+    top->setText(3, statusStr);
     QColor color;
     switch (status) {
         case model::TaskStatus::Success: color = QColor(0, 150, 0); break;
@@ -175,65 +226,60 @@ void TabDownload::onTaskStatusChanged(int taskId, model::TaskStatus status, cons
         case model::TaskStatus::Merging: color = QColor(0, 100, 200); break;
         default: color = QColor(60, 60, 60); break;
     }
-    m_model->item(row, 3)->setForeground(QBrush(color));
+    top->setForeground(3, QBrush(color));
 }
 
 void TabDownload::onTaskFinished(int taskId, bool success, const QString &error) {
-    int row = rowOfTask(taskId);
-    if (row < 0) return;
-    m_model->item(row, 7)->setText("-");
+    auto *top = topItemOf(taskId);
+    if (!top) return;
+    top->setText(7, "-");
     if (!success && !error.isEmpty()) {
-        m_model->item(row, 3)->setText("失败 - " + error);
-        m_model->item(row, 3)->setForeground(QBrush(QColor(200, 0, 0)));
+        top->setText(3, "失败 - " + error);
+        top->setForeground(3, QBrush(QColor(200, 0, 0)));
     }
     if (success) {
         auto task = bili::downloader::DownloadEngine::instance().taskSnapshot(taskId);
         QString output = task.outputFile.isEmpty() && !task.outputFiles.isEmpty()
                              ? task.outputFiles.last() : task.outputFile;
         if (!output.isEmpty()) {
-            m_model->item(row, 1)->setText(task.displayName() + "  ->  " + QDir::toNativeSeparators(output));
-            m_model->item(row, 1)->setToolTip(output);
+            top->setText(1, task.displayName() + "  ->  " + QDir::toNativeSeparators(output));
+            top->setToolTip(1, output);
         }
     }
+    updateTopProgress(taskId);
+}
+
+// 取选中行的顶层任务 id
+static QList<int> selectedTaskIds(QTreeWidget *tree) {
+    QList<int> ids;
+    for (QTreeWidgetItem *it : tree->selectedItems()) {
+        if (!it) continue;
+        int id = it->data(0, ROLE_TASK_ID).toInt();
+        if (id > 0 && !ids.contains(id)) ids << id;
+    }
+    return ids;
 }
 
 void TabDownload::onStartClicked() {
-    auto selection = m_table->selectionModel()->selectedRows();
-    if (selection.isEmpty()) {
-        QMessageBox::information(this, "提示", "请先选择任务");
-        return;
-    }
-    for (const QModelIndex &idx : selection) {
-        int taskId = m_model->item(idx.row(), 0)->text().toInt();
-        bili::downloader::DownloadEngine::instance().startTask(taskId);
-    }
+    auto ids = selectedTaskIds(m_tree);
+    if (ids.isEmpty()) { QMessageBox::information(this, "提示", "请先选择任务"); return; }
+    for (int id : ids) bili::downloader::DownloadEngine::instance().startTask(id);
 }
 
 void TabDownload::onStopClicked() {
-    auto selection = m_table->selectionModel()->selectedRows();
-    if (selection.isEmpty()) {
-        QMessageBox::information(this, "提示", "请先选择任务");
-        return;
-    }
-    for (const QModelIndex &idx : selection) {
-        int taskId = m_model->item(idx.row(), 0)->text().toInt();
-        bili::downloader::DownloadEngine::instance().stopTask(taskId);
-    }
+    auto ids = selectedTaskIds(m_tree);
+    if (ids.isEmpty()) { QMessageBox::information(this, "提示", "请先选择任务"); return; }
+    for (int id : ids) bili::downloader::DownloadEngine::instance().stopTask(id);
 }
 
 void TabDownload::onRemoveClicked() {
-    auto selection = m_table->selectionModel()->selectedRows();
-    if (selection.isEmpty()) {
-        QMessageBox::information(this, "提示", "请先选择任务");
-        return;
-    }
-    int taskId = m_model->item(selection.first().row(), 0)->text().toInt();
+    auto ids = selectedTaskIds(m_tree);
+    if (ids.isEmpty()) { QMessageBox::information(this, "提示", "请先选择任务"); return; }
+    int taskId = ids.first();
     auto &engine = bili::downloader::DownloadEngine::instance();
-    auto task = engine.taskSnapshot(taskId);
     if (engine.isRunning(taskId)) {
         auto ret = QMessageBox::question(this, "确认", QString("任务 #%1 正在下载, 确定要移除吗?").arg(taskId));
-        if (ret != QMessageBox::Yes)
-            return;
+        if (ret != QMessageBox::Yes) return;
     }
     engine.removeTask(taskId);
 }
@@ -253,19 +299,13 @@ void TabDownload::onOpenFolderClicked() {
 }
 
 void TabDownload::refreshSpeeds() {
-    // 定时从引擎拉取最新任务状态刷新表格 (速度/分P进度)
     auto &engine = bili::downloader::DownloadEngine::instance();
     for (int taskId : engine.taskIds()) {
-        int row = rowOfTask(taskId);
-        if (row < 0) continue;
+        updateTopProgress(taskId);
         auto task = engine.taskSnapshot(taskId);
-        if (task.totalClips > 0)
-            m_model->item(row, 5)->setText(
-                QString("%1/%2").arg(task.doneClips).arg(task.totalClips));
-        if (task.status == model::TaskStatus::Downloading && task.speedBytesPerSec > 0)
-            m_model->item(row, 7)->setText(formatSpeed(task.speedBytesPerSec));
-        else if (task.status != model::TaskStatus::Downloading)
-            m_model->item(row, 7)->setText("-");
+        auto *top = topItemOf(taskId);
+        if (top && task.status != model::TaskStatus::Downloading)
+            top->setText(7, "-");
     }
 }
 

@@ -145,11 +145,63 @@ bool TaskRunner::processClipAll(QString &error) {
             emit statusChanged(m_task.taskId, model::TaskStatus::Downloading,
                               QString("已完成 %1/%2").arg(m_task.doneClips).arg(m_task.totalClips));
         }
+        // 计算该分P文件的 SHA256 并写入 sidecar (合并前校验 / 断点恢复用)
+        QString sha = bili::api::Crypto::fileSha256(outFile);
+        if (!sha.isEmpty()) {
+            QFile sidecar(outFile + ".sha256");
+            if (sidecar.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                sidecar.write(sha.toUtf8());
+                sidecar.close();
+            }
+        } else {
+            Logger::warn(QString("分P %1 SHA256 计算失败: %2").arg(i + 1).arg(outFile));
+        }
         emit clipFinished(m_task.taskId, i, outFile);
+        emit clipDone(m_task.taskId, i, outFile, m_task.doneClips, m_task.totalClips, sha);
     }
 
     // ---- 合集合并为单个 MP4 ----
     if (mergeMode && !m_stop.load(std::memory_order_relaxed)) {
+        emit statusChanged(m_task.taskId, model::TaskStatus::Merging, "正在校验合集完整性...");
+        // 合并前校验每个中间分P的 SHA256; 损坏的重新下载修复
+        for (int i = 0; i < intermediateFiles.size(); ++i) {
+            if (m_stop.load(std::memory_order_relaxed))
+                return false;
+            QString &f = intermediateFiles[i];
+            QString sidecarPath = f + ".sha256";
+            QFile sf(sidecarPath);
+            QString expected = sf.open(QIODevice::ReadOnly)
+                                   ? QString::fromUtf8(sf.readAll().trimmed()) : QString();
+            sf.close();
+            QString actual = bili::api::Crypto::fileSha256(f);
+            if (!expected.isEmpty() && actual == expected)
+                continue; // 完好
+            // 缺失 sidecar 或校验不符 => 视为损坏, 删除并重新下载该分P
+            Logger::warn(QString("分P %1 SHA256 校验失败(损坏或缺失记录), 重新下载: %2")
+                             .arg(i + 1).arg(f));
+            emit statusChanged(m_task.taskId, model::TaskStatus::Downloading,
+                              QString("修复损坏分P %1/%2").arg(i + 1).arg(intermediateFiles.size()));
+            QFile::remove(f);
+            QFile::remove(sidecarPath);
+            const model::ClipInfo &clip = m_task.videoInfo.clips.at(i);
+            try {
+                QString workDir = mergeTmpDir;
+                f = processClip(clip, i, workDir,
+                                QString("clip_%1").arg(i + 1, 3, 10, QChar('0')), true);
+                QString newSha = bili::api::Crypto::fileSha256(f);
+                if (!newSha.isEmpty()) {
+                    QFile ns(f + ".sha256");
+                    if (ns.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                        ns.write(newSha.toUtf8());
+                        ns.close();
+                    }
+                }
+            } catch (const std::exception &e) {
+                error = QString("修复损坏分P %1 失败: %2").arg(i + 1).arg(e.what());
+                Logger::error(error);
+                return false;
+            }
+        }
         emit statusChanged(m_task.taskId, model::TaskStatus::Merging, "正在合并合集...");
         QString finalPath = uniqueFilePath(savePath, sanitizeName(m_task.videoInfo.videoName), ".mp4");
         if (!mergeClips(intermediateFiles, finalPath)) {
@@ -160,8 +212,10 @@ bool TaskRunner::processClipAll(QString &error) {
         m_task.outputFiles << finalPath;
         // 清理中间文件
         if (m_task.deleteTempAfterMerge) {
-            for (const QString &f : intermediateFiles)
+            for (const QString &f : intermediateFiles) {
                 QFile::remove(f);
+                QFile::remove(f + ".sha256");
+            }
             QDir().rmdir(mergeTmpDir);
             Logger::info("已清理中间文件: " + mergeTmpDir);
         }
@@ -172,7 +226,6 @@ bool TaskRunner::processClipAll(QString &error) {
 QString TaskRunner::processClip(const model::ClipInfo &clip, int clipIndex,
                                 const QString &workDir, const QString &finalBaseName,
                                 bool forMerge) {
-    Q_UNUSED(clipIndex)
     const QString avId = clip.avId;
     QString cid = QString::number(clip.cid);
     const int qn = m_task.qn;
@@ -228,7 +281,7 @@ QString TaskRunner::processClip(const model::ClipInfo &clip, int clipIndex,
 
     // ---- 4. 下载 ----
     // 速度统计上下文
-    auto progressCb = [this](const HttpClient::Progress &p) {
+    auto progressCb = [this, clipIndex](const HttpClient::Progress &p) {
         qint64 now = QDateTime::currentMSecsSinceEpoch();
         if (m_lastSpeedTime == 0) {
             m_lastSpeedTime = now;
@@ -241,6 +294,8 @@ QString TaskRunner::processClip(const model::ClipInfo &clip, int clipIndex,
             m_lastReceived = p.received;
         }
         emit progress(m_task.taskId, p.received, p.total, m_speed);
+        // 同时汇报该分P自身的进度 (供展开视图显示每个分P进度)
+        emit clipProgress(m_task.taskId, clipIndex, p.received, p.total, m_speed);
     };
     auto isCancelled = [this]() { return m_stop.load(std::memory_order_relaxed); };
     api::Headers downHeaders = HttpClient::m4sHeaders();

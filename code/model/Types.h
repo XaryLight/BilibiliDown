@@ -158,6 +158,17 @@ struct DownloadTask {
     qint64 receivedBytes = 0;  // 已下载
     double speedBytesPerSec = 0; // 瞬时速度
 
+    // 每个分P的独立进度 (索引与 videoInfo.clips 对应)
+    struct ClipProgress {
+        qint64 received = 0;
+        qint64 total = 0;
+        double speed = 0;
+        TaskStatus status = TaskStatus::Queued;
+        QString outputFile;
+        QString sha256;      // 下载完成后计算的 SHA256 (用于合并前校验)
+    };
+    QList<ClipProgress> clipProgress;
+
     QString currentClipTitle;  // 当前处理的分P标题
     QString outputFile;        // 最终输出文件 (单文件模式)
     QStringList outputFiles;   // 输出文件列表 (多文件模式)
